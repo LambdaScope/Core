@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/LambdaScope/Core/schema/events.json",
+  "title": "LambdaScope wire contract",
+  "description": "Canonical shape of every message that crosses a component boundary. Two families: kinesisEvent (extension -> processor) and the wsMessage variants (api -> dashboard). RULES: (1) all timestamps are epoch MILLISECONDS, UTC, integer. (2) every payload carries `v`; bump it when the shape changes incompatibly. (3) consumers MUST ignore unknown fields rather than error, so a field can be added without breaking anyone. (4) fields documented as nullable really do arrive as null - handle it. (5) the enums listed here are exhaustive; a value not listed is invalid.",
+
+  "$defs": {
+    "tier": {
+      "description": "Which observation strategy the extension's seccomp probe settled on. MUST match the serde output of ProbeResult in extension/src/prober.rs, which requires #[serde(rename_all = \"snake_case\")].",
+      "type": "string",
+      "enum": ["kernel_ebpf", "userspace_ebpf", "proc_fallback"]
+    },
+
+    "severity": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "critical"]
+    },
+
+    "anomalyKind": {
+      "type": "string",
+      "enum": ["unknown_endpoint", "fd_leak", "syscall_outlier"]
+    },
+
+    "explanationStatus": {
+      "description": "pending = alert raised, Bedrock still working. ready = explanation present. failed = Bedrock errored; the alert is still valid, only the prose is missing.",
+      "type": "string",
+      "enum": ["pending", "ready", "failed"]
+    },
+
+    "connection": {
+      "type": "object",
+      "required": ["remote_ip", "remote_port", "proto"],
+      "properties": {
+        "remote_ip": { "type": "string", "description": "IPv4 or IPv6 literal. No hostnames." },
+        "remote_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "proto": { "type": "string", "enum": ["tcp", "tcp6", "udp", "udp6"] },
+        "state": { "type": "string", "description": "e.g. ESTABLISHED, TIME_WAIT. Optional." },
+        "first_seen_ms": { "type": "integer", "description": "When in the invocation this connection first appeared." },
+        "bytes_out": { "type": ["integer", "null"], "description": "Null when the tier cannot measure it." }
+      }
+    },
+
+    "fd": {
+      "description": "Raw file-descriptor facts only. The extension does NOT decide whether this is a leak - that judgement needs history across invocations and lives in the processor.",
+      "type": "object",
+      "required": ["start", "end", "delta"],
+      "properties": {
+        "start": { "type": "integer", "description": "Open descriptors when the invocation began." },
+        "end": { "type": "integer", "description": "Open descriptors when it ended." },
+        "delta": { "type": "integer", "description": "end - start. Positive means something was not closed." },
+        "peak": { "type": "integer", "description": "Highest value seen during the invocation." },
+        "limit": { "type": "integer", "description": "Soft RLIMIT_NOFILE. Lets the UI say '32 of 1024' instead of '32'." }
+      }
+    },
+
+    "kinesisEvent": {
+      "description": "Extension -> Kinesis -> processor. PARTITION KEY MUST BE function_arn, so one function's events stay on one shard in order; the FD detector depends on delta ordering.",
+      "type": "object",
+      "required": [
+        "v", "type", "invocation_id", "sandbox_id",
+        "function_arn", "function_name",
+        "start_ms", "duration_ms", "cold_start", "tier", "fd"
+      ],
+      "properties": {
+        "v": { "const": 1 },
+        "type": { "const": "invocation" },
+
+        "invocation_id": { "type": "string", "description": "Lambda request ID. The processor's idempotency key - duplicate records are deduped on this." },
+        "sandbox_id": { "type": "string", "description": "UUID generated ONCE at extension Init and repeated on every event from that warm container. FD leak detection is impossible without it." },
+        "extension_version": { "type": "string" },
+
+        "function_arn": { "type": "string", "description": "Kinesis partition key AND the processor's baseline key." },
+        "function_name": { "type": "string" },
+        "function_version": { "type": "string", "description": "$LATEST or a numbered version. Different versions get different baselines." },
+        "region": { "type": "string" },
+
+        "start_ms": { "type": "integer" },
+        "duration_ms": { "type": "integer" },
+        "cold_start": { "type": "boolean" },
+        "timed_out": { "type": "boolean", "description": "If true the fd.end reading is unreliable and the FD detector skips this event." },
+
+        "tier": { "$ref": "#/$defs/tier" },
+        "degraded": { "type": "boolean", "description": "The extension could not sample properly this invocation." },
+        "degrade_reason": { "type": ["string", "null"] },
+
+        "connections": { "type": "array", "items": { "$ref": "#/$defs/connection" } },
+        "fd": { "$ref": "#/$defs/fd" },
+        "mem_rss_kb": { "type": "integer" },
+        "threads": { "type": "integer" },
+
+        "syscalls": {
+          "description": "Syscall name -> count. ALWAYS null when tier is proc_fallback, because /proc cannot see syscalls. Consumers must handle null and the dashboard must say so rather than render an empty chart.",
+          "type": ["object", "null"],
+          "additionalProperties": { "type": "integer" }
+        }
+      }
+    },
+
+    "anomaly": {
+      "type": "object",
+      "required": ["anomaly_id", "invocation_id", "function_arn", "kind", "severity", "detected_at_ms", "explanation_status"],
+      "properties": {
+        "anomaly_id": { "type": "string" },
+        "invocation_id": { "type": "string" },
+        "sandbox_id": { "type": "string" },
+        "function_arn": { "type": "string" },
+        "function_name": { "type": "string" },
+        "kind": { "$ref": "#/$defs/anomalyKind" },
+        "severity": { "$ref": "#/$defs/severity" },
+        "detected_at_ms": { "type": "integer" },
+        "signature": { "type": "string", "description": "Stable hash of (function_arn, kind, the distinguishing evidence). Used to dedupe alerts and to cache the Bedrock explanation." },
+        "evidence": { "type": "object", "description": "Kind-specific. unknown_endpoint: {endpoint, known_endpoints}. fd_leak: {sandbox_id, growth, window, current, limit}. syscall_outlier: {syscall, count, mean, stddev}." },
+        "explanation": { "type": ["string", "null"], "description": "Null until Bedrock answers." },
+        "explanation_status": { "$ref": "#/$defs/explanationStatus" }
+      }
+    },
+
+    "wsMessage": {
+      "description": "api -> dashboard. Always {v, type, data}. Four types.",
+      "type": "object",
+      "required": ["v", "type", "data"],
+      "properties": {
+        "v": { "const": 1 },
+        "type": { "type": "string", "enum": ["snapshot", "invocation", "anomaly", "anomaly_update"] },
+        "data": {}
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "snapshot" } } },
+          "then": {
+            "description": "Sent ONCE on $connect: the last 50 invocations and 10 anomalies. Without it a freshly opened dashboard is blank until the next event fires, which looks broken.",
+            "properties": {
+              "data": {
+                "type": "object",
+                "properties": {
+                  "invocations": { "type": "array", "items": { "$ref": "#/$defs/kinesisEvent" } },
+                  "anomalies": { "type": "array", "items": { "$ref": "#/$defs/anomaly" } }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "invocation" } } },
+          "then": {
+            "description": "Trimmed invocation. Syscalls are reduced to the top 10 by count - API Gateway frames cap at 128 KB.",
+            "properties": { "data": { "$ref": "#/$defs/kinesisEvent" } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "anomaly" } } },
+          "then": {
+            "description": "Sent the instant an anomaly is detected, with explanation null and explanation_status pending. The dashboard renders the row immediately and shows a spinner where the prose will go.",
+            "properties": { "data": { "$ref": "#/$defs/anomaly" } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "anomaly_update" } } },
+          "then": {
+            "description": "Sent 1-3s later when Bedrock returns. Carries the SAME anomaly_id - the dashboard keys off it and fills in the explanation in place.",
+            "properties": {
+              "data": {
+                "type": "object",
+                "required": ["anomaly_id", "explanation_status"],
+                "properties": {
+                  "anomaly_id": { "type": "string" },
+                  "explanation": { "type": ["string", "null"] },
+                  "explanation_status": { "$ref": "#/$defs/explanationStatus" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
