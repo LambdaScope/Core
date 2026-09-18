@@ -1,19 +1,26 @@
-﻿//! Observer stub.
-//!
-//! Will be implemented in the next task once the probe result has been used
-//! to select a concrete observation strategy (eBPF via aya, rbpf, or /proc).
+pub mod ebpf;
+pub mod proc;
 
+pub use ebpf::{EbpfObserver, SyscallProfile, SyscallEvent, AnomalyHint, AnomalyKind};
 pub use crate::prober::ProbeResult;
+use crate::InvocationContext;
 
-pub struct Observer;
+pub struct Observer {
+    inner: EbpfObserver,
+}
 
 impl Observer {
     pub fn new(probe: &ProbeResult) -> Self {
-        // Strategy wiring will be added in the next task.
-        tracing::info!(
-            "[lambdascope] observer initialized with strategy: {:?}",
-            probe
-        );
-        Observer
+        Observer {
+            inner: EbpfObserver::from_probe(probe),
+        }
+    }
+
+    pub async fn on_invoke_start(&mut self, ctx: &InvocationContext) {
+        self.inner.on_start(ctx).await;
+    }
+
+    pub async fn on_invoke_end(&mut self, ctx: &InvocationContext) -> SyscallProfile {
+        self.inner.on_stop(ctx).await
     }
 }

@@ -1,4 +1,4 @@
-﻿//! lambdascope — AWS Lambda Extension entry point.
+//! lambdascope — AWS Lambda Extension entry point.
 //!
 //! Lifecycle:
 //!   1. Register with the Lambda Extensions API (ExtensionClient::register).
@@ -6,6 +6,8 @@
 //!   3. Initialise the Observer with the probe result.
 //!   4. Enter the INVOKE / SHUTDOWN event loop with full lifecycle hooks.
 
+mod fd;
+mod kinesis;
 mod observer;
 mod prober;
 
@@ -276,30 +278,27 @@ impl ExtensionClient {
 
 // ---------------------------------------------------------------------------
 // Lifecycle hooks
-// (observer will replace these bodies in the next task)
 // ---------------------------------------------------------------------------
 
-/// Called immediately when an INVOKE event is received, before the function
-/// handler runs.  The observer will use this to snapshot /proc state.
-async fn on_invoke_start(ctx: &InvocationContext) {
-    tracing::info!(
-        "[lambdascope] invoke start: requestId={} arn={} deadline={}",
-        ctx.request_id,
-        ctx.invoked_function_arn,
-        ctx.deadline_ms,
-    );
-    // observer will fill this in
+async fn on_invoke_start(observer: &mut Observer, ctx: &InvocationContext) {
+    observer.on_invoke_start(ctx).await;
+    tracing::info!("[lambdascope] invoke start: requestId={}", ctx.request_id);
 }
 
-/// Called just before the next /event/next call, after the function handler
-/// has returned.  The observer will use this to diff /proc state and emit
-/// telemetry.
-async fn on_invoke_end(ctx: &InvocationContext) {
+async fn on_invoke_end(observer: &mut Observer, ctx: &InvocationContext) {
+    let mut profile = observer.on_invoke_end(ctx).await;
+    
+    // FD leak detection
+    profile.fd_leak_report = fd::detect_leaks(&profile);
+    
     tracing::info!(
-        "[lambdascope] invoke end: requestId={}",
+        "[lambdascope] invoke end: requestId={} syscalls={} anomalies={} leaks={}",
         ctx.request_id,
+        profile.events.len(),
+        profile.anomalies.len(),
+        profile.fd_leak_report.as_ref().map(|r| r.leaked_count).unwrap_or(0)
     );
-    // observer will fill this in
+    kinesis::write(profile).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -333,7 +332,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     prober::init();
 
     // 6. Initialise the Observer with the probe result.
-    let _observer = Observer::new(prober::get());
+    let mut observer = Observer::new(prober::get());
 
     // 7. Announce readiness with the chosen strategy.
     tracing::info!(
@@ -350,7 +349,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // On the very first iteration current_invocation is None, so this is
         // a no-op and we go straight into the long-poll.
         if let Some(ctx) = &current_invocation {
-            on_invoke_end(ctx).await;
+            on_invoke_end(&mut observer, ctx).await;
         }
 
         // Fetch the next event, with retry logic on transient network errors.
@@ -385,14 +384,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         match event {
             ExtensionEvent::Invoke(ctx) => {
                 current_invocation = Some(ctx.clone());
-                on_invoke_start(&ctx).await;
+                on_invoke_start(&mut observer, &ctx).await;
             }
 
             ExtensionEvent::Shutdown { reason, timeout_ms } => {
                 // Fire on_invoke_end for any in-progress invocation so the
                 // observer has a chance to flush its telemetry.
                 if let Some(ctx) = &current_invocation {
-                    on_invoke_end(ctx).await;
+                    on_invoke_end(&mut observer, ctx).await;
                 }
 
                 tracing::info!(
