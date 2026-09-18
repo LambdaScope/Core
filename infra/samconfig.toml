@@ -1,0 +1,32 @@
+# samconfig.toml — SAM deployment configuration for LambdaScope.
+# All default parameters for `sam deploy` are stored here so the stack
+# deploys with a single command and zero prompts, from any machine or CI runner.
+# Target region: ap-south-1 (Mumbai) — change only if the team migrates regions.
+
+version = 0.1
+
+[default.deploy.parameters]
+
+# CloudFormation stack name.
+stack_name = "lambdascope"
+
+# AWS region — Mumbai. Must match any region-specific ARNs used by the team.
+region = "ap-south-1"
+
+# Skip the changeset review prompt. Required for non-interactive CI/CD and
+# live demo deploys. Judges can run `sam deploy` without any manual input.
+confirm_changeset = false
+
+# CAPABILITY_IAM       — required to create IAM roles and policies.
+# CAPABILITY_NAMED_IAM — required because the template uses explicit RoleNames
+#                        (lambdascope-extension-role, -processor-role, -api-role).
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+
+# Let SAM create and manage the deployment S3 bucket automatically.
+resolve_s3 = true
+
+# S3 key prefix for all packaged deployment artifacts.
+s3_prefix = "lambdascope"
+
+# Path where `sam package` writes the resolved, uploadable template.
+output_template_file = ".aws-sam/build/packaged.yaml"

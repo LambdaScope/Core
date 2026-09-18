@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  LambdaScope — eBPF observability layer for AWS Lambda.
+  Provisions the shared infrastructure: Kinesis event stream, DynamoDB
+  invocation store, API Gateway WebSocket API, SNS alert topic, and the
+  three scoped IAM execution roles consumed by the Rust extension,
+  Go processor Lambda, and WebSocket API Lambda.
+
+# ---------------------------------------------------------------------------
+# Global defaults applied to every AWS::Serverless::Function resource.
+# Infrastructure-only template — no Lambda functions are defined here.
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    Architectures:
+      - arm64
+    Runtime: provided.al2023
+    Tags:
+      Project: LambdaScope
+
+# ===========================================================================
+# RESOURCES
+# ===========================================================================
+Resources:
+
+  # -------------------------------------------------------------------------
+  # Kinesis Data Stream
+  # Sudhanshu's Rust Lambda Extension writes syscall observation events here.
+  # Divyansh's Go processor Lambda reads from this stream.
+  # -------------------------------------------------------------------------
+  LambdaScopeKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Description: >
+      Kinesis Data Stream that ingests raw eBPF syscall observation events
+      emitted by the Rust Lambda Extension attached to every monitored
+      function. Single shard — scale up shards for higher throughput.
+    Properties:
+      Name: lambdascope-events
+      ShardCount: 1
+      Tags:
+        - Key: Project
+          Value: LambdaScope
+
+  # -------------------------------------------------------------------------
+  # DynamoDB Table
+  # Divyansh's Go processor Lambda writes processed invocation records here.
+  # -------------------------------------------------------------------------
+  LambdaScopeDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Description: >
+      Stores processed per-invocation telemetry records produced by the Go
+      processor Lambda. Partition key is the Lambda request ID (invocationId).
+      PAY_PER_REQUEST billing keeps costs zero when idle during the hackathon.
+    Properties:
+      TableName: lambdascope-invocations
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: invocationId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: invocationId
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: LambdaScope
+
+  # -------------------------------------------------------------------------
+  # API Gateway WebSocket API
+  # Thushar's dashboard connects here for a live eBPF event feed.
+  # -------------------------------------------------------------------------
+  LambdaScopeWebSocketAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Description: >
+      WebSocket API that Thushar's dashboard connects to for a real-time
+      feed of processed eBPF events. Route selection is driven by the
+      'action' field in the JSON body sent by the client.
+    Properties:
+      Name: lambdascope-ws
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+      Tags:
+        Project: LambdaScope
+
+  # $connect route — fires when a client opens a WebSocket connection.
+  LambdaScopeConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Description: >
+      Handles new WebSocket connections. The integration target (WebSocket
+      API Lambda) registers the connectionId for downstream fan-out.
+    Properties:
+      ApiId: !Ref LambdaScopeWebSocketAPI
+      RouteKey: "$connect"
+      AuthorizationType: NONE
+
+  # $disconnect route — fires when a client closes or drops the connection.
+  LambdaScopeDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Description: >
+      Handles WebSocket disconnection events. The integration target removes
+      the stale connectionId so the fan-out list stays clean.
+    Properties:
+      ApiId: !Ref LambdaScopeWebSocketAPI
+      RouteKey: "$disconnect"
+      AuthorizationType: NONE
+
+  # $default route — catches all messages that don't match a named route.
+  LambdaScopeDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Description: >
+      Catch-all route for WebSocket messages. Used to handle subscription
+      requests and any custom actions forwarded by the dashboard.
+    Properties:
+      ApiId: !Ref LambdaScopeWebSocketAPI
+      RouteKey: "$default"
+      AuthorizationType: NONE
+
+  # WebSocket deployment — required before a stage can be created.
+  LambdaScopeWebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    Description: >
+      Snapshot deployment of the WebSocket API. A new deployment is created
+      on every 'sam deploy' that changes the API definition.
+    DependsOn:
+      - LambdaScopeConnectRoute
+      - LambdaScopeDisconnectRoute
+      - LambdaScopeDefaultRoute
+    Properties:
+      ApiId: !Ref LambdaScopeWebSocketAPI
+
+  # 'prod' stage — the stage Thushar's dashboard URL points to.
+  LambdaScopeWebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Description: >
+      Production stage of the WebSocket API. Explicit deployment is used
+      so every sam deploy produces a traceable, auditable rollout.
+    Properties:
+      ApiId: !Ref LambdaScopeWebSocketAPI
+      DeploymentId: !Ref LambdaScopeWebSocketDeployment
+      StageName: prod
+      Tags:
+        Project: LambdaScope
+
+  # -------------------------------------------------------------------------
+  # SNS Topic
+  # Divyansh's Go processor publishes anomaly alerts (unexpected network
+  # calls, privilege escalation attempts, etc.) to this topic.
+  # -------------------------------------------------------------------------
+  LambdaScopeSNSTopic:
+    Type: AWS::SNS::Topic
+    Description: >
+      Receives anomaly alert notifications published by the Go processor
+      Lambda when it detects suspicious syscall patterns — e.g. unexpected
+      outbound network calls or restricted file-system access attempts.
+    Properties:
+      TopicName: lambdascope-alerts
+      Tags:
+        - Key: Project
+          Value: LambdaScope
+
+  # ===========================================================================
+  # IAM ROLES
+  # Three tightly-scoped roles following least-privilege principle.
+  # ===========================================================================
+
+  # -------------------------------------------------------------------------
+  # Extension Role — Sudhanshu's Rust Lambda Extension
+  # Grants write access to the Kinesis stream only.
+  # -------------------------------------------------------------------------
+  LambdaScopeExtensionRole:
+    Type: AWS::IAM::Role
+    Description: >
+      Execution role for Sudhanshu's Rust Lambda Extension. Grants only the
+      Kinesis PutRecord/PutRecords permissions needed to ship eBPF syscall
+      events to the lambdascope-events stream, plus the CloudWatch Logs
+      permissions required by every Lambda execution environment.
+    Properties:
+      RoleName: lambdascope-extension-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Provides CreateLogGroup, CreateLogStream, PutLogEvents.
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: lambdascope-extension-kinesis-write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: KinesisWrite
+                Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt LambdaScopeKinesisStream.Arn
+      Tags:
+        - Key: Project
+          Value: LambdaScope
+
+  # -------------------------------------------------------------------------
+  # Processor Role — Divyansh's Go processor Lambda
+  # Reads from Kinesis, writes to DynamoDB, publishes to SNS.
+  # -------------------------------------------------------------------------
+  LambdaScopeProcessorRole:
+    Type: AWS::IAM::Role
+    Description: >
+      Execution role for Divyansh's Go processor Lambda. Grants Kinesis
+      consumer permissions to read the eBPF event stream, DynamoDB write
+      permissions to persist processed invocation records, and SNS publish
+      permission to fire anomaly alerts.
+    Properties:
+      RoleName: lambdascope-processor-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: lambdascope-processor-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: KinesisRead
+                Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:ListShards
+                Resource: !GetAtt LambdaScopeKinesisStream.Arn
+              - Sid: DynamoDBWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt LambdaScopeDynamoDBTable.Arn
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref LambdaScopeSNSTopic
+      Tags:
+        - Key: Project
+          Value: LambdaScope
+
+  # -------------------------------------------------------------------------
+  # API Role — Divyansh's WebSocket API Lambda
+  # Reads from DynamoDB, manages WebSocket connections via execute-api.
+  # -------------------------------------------------------------------------
+  LambdaScopeAPIRole:
+    Type: AWS::IAM::Role
+    Description: >
+      Execution role for the WebSocket API Lambda that backs the
+      lambdascope-ws API Gateway. Grants DynamoDB read access to serve
+      historical invocation data and execute-api:ManageConnections to
+      push real-time events back to connected dashboard clients.
+    Properties:
+      RoleName: lambdascope-api-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: lambdascope-api-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoDBRead
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource: !GetAtt LambdaScopeDynamoDBTable.Arn
+              - Sid: WebSocketManageConnections
+                Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                # Scoped to the prod stage of this specific WebSocket API.
+                Resource: !Sub >-
+                  arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${LambdaScopeWebSocketAPI}/prod/*
+      Tags:
+        - Key: Project
+          Value: LambdaScope
+
+# ===========================================================================
+# OUTPUTS
+# All values are exported so teammates can reference them via
+# cross-stack lookups or copy them from the CloudFormation console.
+# ===========================================================================
+Outputs:
+
+  KinesisStreamArn:
+    Description: >
+      ARN of the lambdascope-events Kinesis stream.
+      Needed by Sudhanshu (Rust extension) and Divyansh (Go processor).
+    Value: !GetAtt LambdaScopeKinesisStream.Arn
+    Export:
+      Name: LambdaScope-KinesisStreamArn
+
+  KinesisStreamName:
+    Description: >
+      Name of the lambdascope-events Kinesis stream.
+      Needed by Sudhanshu (Rust extension) and Divyansh (Go processor).
+    Value: !Ref LambdaScopeKinesisStream
+    Export:
+      Name: LambdaScope-KinesisStreamName
+
+  DynamoDBTableName:
+    Description: >
+      Name of the lambdascope-invocations DynamoDB table.
+      Needed by Divyansh (Go processor and WebSocket API Lambda).
+    Value: !Ref LambdaScopeDynamoDBTable
+    Export:
+      Name: LambdaScope-DynamoDBTableName
+
+  WebSocketURL:
+    Description: >
+      WSS endpoint for the lambdascope-ws WebSocket API (prod stage).
+      Needed by Thushar to configure the dashboard connection string.
+    Value: !Sub "wss://${LambdaScopeWebSocketAPI}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Export:
+      Name: LambdaScope-WebSocketURL
+
+  SNSTopicArn:
+    Description: >
+      ARN of the lambdascope-alerts SNS topic.
+      Needed by Divyansh to publish anomaly alert notifications.
+    Value: !Ref LambdaScopeSNSTopic
+    Export:
+      Name: LambdaScope-SNSTopicArn
+
+  ExtensionRoleArn:
+    Description: >
+      ARN of the lambdascope-extension-role IAM role.
+      Needed by Sudhanshu — attach this role to the monitored Lambda
+      functions that load the Rust eBPF extension layer.
+    Value: !GetAtt LambdaScopeExtensionRole.Arn
+    Export:
+      Name: LambdaScope-ExtensionRoleArn
