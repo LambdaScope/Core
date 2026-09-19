@@ -1,0 +1,316 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: "LambdaScope \u2014 eBPF observability layer for AWS Lambda. Provisions\
+  \ the shared infrastructure: Kinesis event stream, DynamoDB invocation store, API\
+  \ Gateway WebSocket API, SNS alert topic, and the three scoped IAM execution roles\
+  \ consumed by the Rust extension, Go processor Lambda, and WebSocket API Lambda.\n"
+Globals:
+  Function:
+    Architectures:
+    - arm64
+    Runtime: provided.al2023
+    Tags:
+      Project: LambdaScope
+Resources:
+  LambdaScopeKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Description: "Kinesis Data Stream that ingests raw eBPF syscall observation events\
+      \ emitted by the Rust Lambda Extension attached to every monitored function.\
+      \ Single shard \u2014 scale up shards for higher throughput.\n"
+    Properties:
+      Name: lambdascope-events
+      ShardCount: 1
+      Tags:
+      - Key: Project
+        Value: LambdaScope
+  LambdaScopeDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Description: 'Stores processed per-invocation telemetry records produced by the
+      Go processor Lambda. Partition key is the Lambda request ID (invocationId).
+      PAY_PER_REQUEST billing keeps costs zero when idle during the hackathon.
+
+      '
+    Properties:
+      TableName: lambdascope-invocations
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: invocationId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: invocationId
+        KeyType: HASH
+      Tags:
+      - Key: Project
+        Value: LambdaScope
+  LambdaScopeWebSocketAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Description: 'WebSocket API that Thushar''s dashboard connects to for a real-time
+      feed of processed eBPF events. Route selection is driven by the ''action'' field
+      in the JSON body sent by the client.
+
+      '
+    Properties:
+      Name: lambdascope-ws
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.action
+      Tags:
+        Project: LambdaScope
+  LambdaScopeConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Description: 'Handles new WebSocket connections. The integration target (WebSocket
+      API Lambda) registers the connectionId for downstream fan-out.
+
+      '
+    Properties:
+      ApiId:
+        Ref: LambdaScopeWebSocketAPI
+      RouteKey: $connect
+      AuthorizationType: NONE
+  LambdaScopeDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Description: 'Handles WebSocket disconnection events. The integration target removes
+      the stale connectionId so the fan-out list stays clean.
+
+      '
+    Properties:
+      ApiId:
+        Ref: LambdaScopeWebSocketAPI
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+  LambdaScopeDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Description: 'Catch-all route for WebSocket messages. Used to handle subscription
+      requests and any custom actions forwarded by the dashboard.
+
+      '
+    Properties:
+      ApiId:
+        Ref: LambdaScopeWebSocketAPI
+      RouteKey: $default
+      AuthorizationType: NONE
+  LambdaScopeWebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    Description: 'Snapshot deployment of the WebSocket API. A new deployment is created
+      on every ''sam deploy'' that changes the API definition.
+
+      '
+    DependsOn:
+    - LambdaScopeConnectRoute
+    - LambdaScopeDisconnectRoute
+    - LambdaScopeDefaultRoute
+    Properties:
+      ApiId:
+        Ref: LambdaScopeWebSocketAPI
+  LambdaScopeWebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Description: 'Production stage of the WebSocket API. Explicit deployment is used
+      so every sam deploy produces a traceable, auditable rollout.
+
+      '
+    Properties:
+      ApiId:
+        Ref: LambdaScopeWebSocketAPI
+      DeploymentId:
+        Ref: LambdaScopeWebSocketDeployment
+      StageName: prod
+      Tags:
+        Project: LambdaScope
+  LambdaScopeSNSTopic:
+    Type: AWS::SNS::Topic
+    Description: "Receives anomaly alert notifications published by the Go processor\
+      \ Lambda when it detects suspicious syscall patterns \u2014 e.g. unexpected\
+      \ outbound network calls or restricted file-system access attempts.\n"
+    Properties:
+      TopicName: lambdascope-alerts
+      Tags:
+      - Key: Project
+        Value: LambdaScope
+  LambdaScopeExtensionRole:
+    Type: AWS::IAM::Role
+    Description: 'Execution role for Sudhanshu''s Rust Lambda Extension. Grants only
+      the Kinesis PutRecord/PutRecords permissions needed to ship eBPF syscall events
+      to the lambdascope-events stream, plus the CloudWatch Logs permissions required
+      by every Lambda execution environment.
+
+      '
+    Properties:
+      RoleName: lambdascope-extension-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: lambdascope-extension-kinesis-write
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: KinesisWrite
+            Effect: Allow
+            Action:
+            - kinesis:PutRecord
+            - kinesis:PutRecords
+            Resource:
+              Fn::GetAtt:
+              - LambdaScopeKinesisStream
+              - Arn
+      Tags:
+      - Key: Project
+        Value: LambdaScope
+  LambdaScopeProcessorRole:
+    Type: AWS::IAM::Role
+    Description: 'Execution role for Divyansh''s Go processor Lambda. Grants Kinesis
+      consumer permissions to read the eBPF event stream, DynamoDB write permissions
+      to persist processed invocation records, and SNS publish permission to fire
+      anomaly alerts.
+
+      '
+    Properties:
+      RoleName: lambdascope-processor-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: lambdascope-processor-permissions
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: KinesisRead
+            Effect: Allow
+            Action:
+            - kinesis:GetRecords
+            - kinesis:GetShardIterator
+            - kinesis:DescribeStream
+            - kinesis:ListShards
+            Resource:
+              Fn::GetAtt:
+              - LambdaScopeKinesisStream
+              - Arn
+          - Sid: DynamoDBWrite
+            Effect: Allow
+            Action:
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            Resource:
+              Fn::GetAtt:
+              - LambdaScopeDynamoDBTable
+              - Arn
+          - Sid: SNSPublish
+            Effect: Allow
+            Action:
+            - sns:Publish
+            Resource:
+              Ref: LambdaScopeSNSTopic
+      Tags:
+      - Key: Project
+        Value: LambdaScope
+  LambdaScopeAPIRole:
+    Type: AWS::IAM::Role
+    Description: 'Execution role for the WebSocket API Lambda that backs the lambdascope-ws
+      API Gateway. Grants DynamoDB read access to serve historical invocation data
+      and execute-api:ManageConnections to push real-time events back to connected
+      dashboard clients.
+
+      '
+    Properties:
+      RoleName: lambdascope-api-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: lambdascope-api-permissions
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: DynamoDBRead
+            Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:Query
+            Resource:
+              Fn::GetAtt:
+              - LambdaScopeDynamoDBTable
+              - Arn
+          - Sid: WebSocketManageConnections
+            Effect: Allow
+            Action:
+            - execute-api:ManageConnections
+            Resource:
+              Fn::Sub: arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${LambdaScopeWebSocketAPI}/prod/*
+      Tags:
+      - Key: Project
+        Value: LambdaScope
+Outputs:
+  KinesisStreamArn:
+    Description: 'ARN of the lambdascope-events Kinesis stream. Needed by Sudhanshu
+      (Rust extension) and Divyansh (Go processor).
+
+      '
+    Value:
+      Fn::GetAtt:
+      - LambdaScopeKinesisStream
+      - Arn
+    Export:
+      Name: LambdaScope-KinesisStreamArn
+  KinesisStreamName:
+    Description: 'Name of the lambdascope-events Kinesis stream. Needed by Sudhanshu
+      (Rust extension) and Divyansh (Go processor).
+
+      '
+    Value:
+      Ref: LambdaScopeKinesisStream
+    Export:
+      Name: LambdaScope-KinesisStreamName
+  DynamoDBTableName:
+    Description: 'Name of the lambdascope-invocations DynamoDB table. Needed by Divyansh
+      (Go processor and WebSocket API Lambda).
+
+      '
+    Value:
+      Ref: LambdaScopeDynamoDBTable
+    Export:
+      Name: LambdaScope-DynamoDBTableName
+  WebSocketURL:
+    Description: 'WSS endpoint for the lambdascope-ws WebSocket API (prod stage).
+      Needed by Thushar to configure the dashboard connection string.
+
+      '
+    Value:
+      Fn::Sub: wss://${LambdaScopeWebSocketAPI}.execute-api.${AWS::Region}.amazonaws.com/prod
+    Export:
+      Name: LambdaScope-WebSocketURL
+  SNSTopicArn:
+    Description: 'ARN of the lambdascope-alerts SNS topic. Needed by Divyansh to publish
+      anomaly alert notifications.
+
+      '
+    Value:
+      Ref: LambdaScopeSNSTopic
+    Export:
+      Name: LambdaScope-SNSTopicArn
+  ExtensionRoleArn:
+    Description: "ARN of the lambdascope-extension-role IAM role. Needed by Sudhanshu\
+      \ \u2014 attach this role to the monitored Lambda functions that load the Rust\
+      \ eBPF extension layer.\n"
+    Value:
+      Fn::GetAtt:
+      - LambdaScopeExtensionRole
+      - Arn
+    Export:
+      Name: LambdaScope-ExtensionRoleArn
