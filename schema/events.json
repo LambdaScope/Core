@@ -22,7 +22,7 @@
     },
 
     "explanationStatus": {
-      "description": "pending = alert raised, Bedrock still working. ready = explanation present. failed = Bedrock errored; the alert is still valid, only the prose is missing.",
+      "description": "pending = alert raised, Bedrock still working. ready = explanation present. failed = the model could not explain it (error, refusal or timeout). The alert is still valid and explanation still holds text - a deterministic summary generated locally - so it is never empty.",
       "type": "string",
       "enum": ["pending", "ready", "failed"]
     },
@@ -128,7 +128,7 @@
         {
           "if": { "properties": { "type": { "const": "snapshot" } } },
           "then": {
-            "description": "Sent ONCE on $connect: the last 50 invocations and 10 anomalies. Without it a freshly opened dashboard is blank until the next event fires, which looks broken.",
+            "description": "Sent once, to one viewer, in reply to {\"action\": \"snapshot\"} - the dashboard must send that as soon as the socket opens. It cannot be pushed from $connect: API Gateway does not allow posting to a connection until its $connect handler has returned. Contains up to the last 50 invocations and 10 anomalies (older invocations are dropped first if the frame would exceed 128 KB). Without it a freshly opened dashboard is blank until the next event fires.",
             "properties": {
               "data": {
                 "type": "object",
