@@ -8,6 +8,7 @@ package schema
 import (
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 )
 
@@ -245,4 +246,35 @@ func NewWSMessage(msgType string, data any) WSMessage {
 type Snapshot struct {
 	Invocations []InvocationEvent `json:"invocations"`
 	Anomalies   []Anomaly         `json:"anomalies"`
+}
+
+// MaxSyscallsOnWire caps how much of the syscall map is sent to a browser.
+// API Gateway rejects WebSocket frames over 128 KB, and the dashboard only
+// renders a handful of bars anyway.
+const MaxSyscallsOnWire = 10
+
+// ForWire returns a copy of the event fit to send to the dashboard: the syscall
+// map is reduced to the highest-count entries. The receiver is not modified.
+func (e InvocationEvent) ForWire() InvocationEvent {
+	out := e
+	if len(e.Syscalls) <= MaxSyscallsOnWire {
+		return out
+	}
+	names := make([]string, 0, len(e.Syscalls))
+	for k := range e.Syscalls {
+		names = append(names, k)
+	}
+	// Highest count first; ties broken by name so the result is stable.
+	sort.Slice(names, func(i, j int) bool {
+		a, b := e.Syscalls[names[i]], e.Syscalls[names[j]]
+		if a != b {
+			return a > b
+		}
+		return names[i] < names[j]
+	})
+	out.Syscalls = make(map[string]int, MaxSyscallsOnWire)
+	for _, k := range names[:MaxSyscallsOnWire] {
+		out.Syscalls[k] = e.Syscalls[k]
+	}
+	return out
 }
