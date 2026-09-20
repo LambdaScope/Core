@@ -1,0 +1,158 @@
+@import "tailwindcss";
+
+:root {
+  /* Tactical Security Operations Theme */
+  --bg-base: #07090e;
+  --bg-surface: #0c0f17;
+  --bg-raised: #111622;
+  --bg-overlay: #171d2c;
+  
+  /* Crisp 1px Borders */
+  --border-subtle: #151a26;
+  --border-default: #1e2638;
+  --border-highlight: #2c3850;
+
+  /* Typography Colors */
+  --text-primary: #e6edf3;
+  --text-secondary: #8b9bb4;
+  --text-muted: #526077;
+  --text-dim: #3a4556;
+
+  /* Restrained Terminal Accent (Precise cyber green) */
+  --accent: #00d26a;
+  --accent-hover: #00b85c;
+  --accent-subtle: rgba(0, 210, 106, 0.08);
+  --accent-border: rgba(0, 210, 106, 0.25);
+  --accent-glow: rgba(0, 210, 106, 0.3);
+
+  /* Strict Severity Scale */
+  /* Info (Steel Blue) */
+  --severity-info: #38bdf8;
+  --severity-info-bg: rgba(56, 189, 248, 0.08);
+  --severity-info-border: rgba(56, 189, 248, 0.28);
+
+  /* Warning (Tactical Amber) */
+  --severity-warning: #fbbf24;
+  --severity-warning-bg: rgba(251, 191, 36, 0.09);
+  --severity-warning-border: rgba(251, 191, 36, 0.32);
+
+  /* Critical (High-Alert Crimson - Screaming contrast against dark UI) */
+  --severity-critical: #ff1f4b;
+  --severity-critical-bg: rgba(255, 31, 75, 0.16);
+  --severity-critical-border: #ff1f4b;
+  --severity-critical-glow: rgba(255, 31, 75, 0.7);
+}
+
+@theme {
+  --color-base: var(--bg-base);
+  --color-surface: var(--bg-surface);
+  --color-raised: var(--bg-raised);
+  --color-overlay: var(--bg-overlay);
+
+  --color-border-subtle: var(--border-subtle);
+  --color-border-default: var(--border-default);
+  --color-border-highlight: var(--border-highlight);
+
+  --color-primary: var(--text-primary);
+  --color-secondary: var(--text-secondary);
+  --color-muted: var(--text-muted);
+  --color-dim: var(--text-dim);
+
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-subtle: var(--accent-subtle);
+  --color-accent-border: var(--accent-border);
+  --color-accent-glow: var(--accent-glow);
+
+  --color-severity-info: var(--severity-info);
+  --color-severity-info-bg: var(--severity-info-bg);
+  --color-severity-info-border: var(--severity-info-border);
+
+  --color-severity-warning: var(--severity-warning);
+  --color-severity-warning-bg: var(--severity-warning-bg);
+  --color-severity-warning-border: var(--severity-warning-border);
+
+  --color-severity-critical: var(--severity-critical);
+  --color-severity-critical-bg: var(--severity-critical-bg);
+  --color-severity-critical-border: var(--severity-critical-border);
+  --color-severity-critical-glow: var(--severity-critical-glow);
+
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* Security Ops Grid Background & Scanlines */
+.bg-security-grid {
+  background-color: var(--bg-base);
+  background-image: 
+    linear-gradient(to right, rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+.bg-scanlines {
+  background: linear-gradient(
+    rgba(18, 16, 16, 0) 50%, 
+    rgba(0, 0, 0, 0.25) 50%
+  ), linear-gradient(
+    90deg,
+    rgba(255, 0, 0, 0.03),
+    rgba(0, 255, 0, 0.01),
+    rgba(0, 0, 255, 0.03)
+  );
+  background-size: 100% 3px, 6px 100%;
+}
+
+@keyframes criticalAlarmPulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(255, 31, 75, 0.4), inset 0 0 8px rgba(255, 31, 75, 0.2);
+    border-color: rgba(255, 31, 75, 0.8);
+  }
+  50% {
+    box-shadow: 0 0 24px 6px rgba(255, 31, 75, 0.75), inset 0 0 16px rgba(255, 31, 75, 0.4);
+    border-color: #ff1f4b;
+  }
+}
+
+@keyframes subtleRadarSweep {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100%); }
+}
+
+@keyframes shimmerEffect {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.animate-critical-glow {
+  animation: criticalAlarmPulse 1.6s infinite ease-in-out;
+}
+
+.animate-shimmer {
+  animation: shimmerEffect 1.8s infinite linear;
+}
+
+/* Dense, sleek terminal scrollbars */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-base);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: 1px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-highlight);
+}
+
+body {
+  margin: 0;
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  overflow-x: hidden;
+  letter-spacing: -0.01em;
+}
